@@ -138,7 +138,7 @@ async def generate_mockup(prompt: str, images_b64: list[str]) -> bytes | str:
         "contents": [{"parts": parts}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=600) as client:
         r = await client.post(_url("gemini-3-pro-image-preview"), json=payload)
         r.raise_for_status()
         data = r.json()
