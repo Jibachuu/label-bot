@@ -196,11 +196,11 @@ async def generate_svg(prompt: str, model_key: str, size_key: str, images_b64: l
 async def send_svg(update: Update, svg_code: str, prompt: str, size_key: str):
     size_label, w, h = SIZES[size_key]
     svg_bytes = BytesIO(svg_code.encode("utf-8"))
+    
     await update.message.reply_document(
         document=svg_bytes,
         filename=f"label_{size_key}.svg",
-        caption=f"📄 *{prompt}*\n📐 {size_label} — {w}×{h}мм\n🎨 Spot_1 (белый) + CMYK | прозрачный фон",
-        parse_mode="Markdown",
+        caption=f"📄 Макет готов!\n📐 {size_label} — {w}×{h}мм\n🎨 Spot_1 (белый) + CMYK | прозрачный фон"
     )
     intro = "```xml\n" + f"<!-- {size_label} ({w}×{h}мм) | Spot_1=белый | прозрачный фон -->\n"
     outro = "\n```"
@@ -417,9 +417,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error("Gemini error: %s", e.response.text)
             await status_msg.edit_text("❌ Ошибка Gemini API.")
         except Exception as e:
-            anim.cancel()
-            logger.exception("handle_photo error")
-            await status_msg.edit_text(f"❌ Ошибка: {e}")
+        anim.cancel()
+        logger.exception("handle_svg_text error")
+        # Отправляем новое сообщение, так как старое с точками могло быть уже удалено
+        await update.message.reply_text("❌ Произошла ошибка при отправке файла или генерации.")
 
 
 async def handle_svg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -449,7 +450,8 @@ async def handle_svg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         anim.cancel()
         logger.exception("handle_svg_text error")
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        # Отправляем новое сообщение, так как старое с точками могло быть уже удалено
+        await update.message.reply_text("❌ Произошла ошибка при отправке файла или генерации.")
 
 # ── Запуск ─────────────────────────────────────────────────────────────────
 
