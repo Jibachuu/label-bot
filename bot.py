@@ -2,8 +2,10 @@ import os
 import re
 import base64
 import logging
+import asyncio
 import httpx
 from io import BytesIO
+from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,7 +27,6 @@ def _url(model: str) -> str:
         f"{model}:generateContent?key={GEMINI_API_KEY}"
     )
 
-# ── Модели ─────────────────────────────────────────────────────────────────
 MODELS = {
     "flash": ("gemini-2.0-flash",             "⚡ Flash 2.0  — быстро и дёшево"),
     "pro25": ("gemini-2.5-pro-preview-06-05", "🧠 Pro 2.5    — умнее"),
@@ -33,7 +34,6 @@ MODELS = {
 }
 DEFAULT_MODEL = "pro31"
 
-# ── Размеры макетов (мм) ───────────────────────────────────────────────────
 SIZES = {
     "300_no_cap":   ("🧴 300мл без крышки",  150.0,   58.0),
     "500_no_cap":   ("🧴 500мл без крышки",  176.48,  76.48),
@@ -41,7 +41,6 @@ SIZES = {
 }
 DEFAULT_SIZE = "300_no_cap"
 
-# ── Палитра ────────────────────────────────────────────────────────────────
 SPOT_COLORS = [("Spot_1", "#FFFFFF", "белый — Spot_1 (именованная Spot-краска)")]
 CMYK_COLORS = [
     ("cmyk_cyan",    "#00AEEF", "голубой (C)"),
@@ -53,13 +52,32 @@ CMYK_COLORS = [
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Буфер для группировки альбомов (media_group_id → список фото)
+album_buffer: dict[str, list] = defaultdict(list)
+album_tasks:  dict[str, asyncio.Task] = {}
+
+# ── Анимация загрузки ──────────────────────────────────────────────────────
+
+async def loading_animation(msg, text: str):
+    """Мигающие точки пока идёт генерация."""
+    dots = ["   ", ".  ", ".. ", "..."]
+    i = 0
+    while True:
+        try:
+            await msg.edit_text(f"⏳ {text}{dots[i % 4]}")
+            i += 1
+            await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            break
+
 # ── SVG helpers ────────────────────────────────────────────────────────────
 
 def build_spot_defs() -> str:
     lines = ["  <defs>", "    <!-- Spot_1 = белая краска (RIP читает id как имя Spot) -->"]
     for spot_id, hex_val, _ in SPOT_COLORS:
         lines.append(f'    <linearGradient id="{spot_id}"><stop offset="0" stop-color="{hex_val}"/></linearGradient>')
-    lines.append("    <!-- CMYK цвета (не Spot, используются напрямую как hex) -->")
     for _, hex_val, desc in CMYK_COLORS:
         lines.append(f'    <!-- {desc}: {hex_val} -->')
     lines.append("  </defs>")
@@ -74,111 +92,114 @@ def inject_spot_defs(svg_code: str) -> str:
 def palette_for_prompt() -> str:
     cmyk_list = "\n".join(f'  fill="{h}"  →  {d}' for _, h, d in CMYK_COLORS)
     return f"""ПРАВИЛА ЦВЕТОВ:
-✅ Белый — ТОЛЬКО fill="url(#Spot_1)"  (Spot-краска, НЕ #ffffff)
-✅ CMYK — обычные hex:
+✅ Белый — ТОЛЬКО fill="url(#Spot_1)"
+✅ CMYK hex:
 {cmyk_list}
-❌ НЕ используй другие цвета, rgb(), hsl(), named colors."""
+❌ НЕ используй rgb(), hsl(), named colors."""
 
 def size_for_prompt(size_key: str) -> str:
     label, w, h = SIZES[size_key]
     return (
-        f"Размер макета: {w} x {h} мм ({label})\n"
-        f'SVG атрибуты: width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"\n'
-        f"Единицы координат = миллиметры.\n"
-        f"Подложка — ПРОЗРАЧНАЯ. НЕ рисуй background rect на весь размер."
+        f"Размер: {w}x{h}мм ({label})\n"
+        f'width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"\n'
+        f"Подложка ПРОЗРАЧНАЯ — никакого background rect."
     )
 
 # ── Скачивание фото ────────────────────────────────────────────────────────
 
-async def download_photo_base64(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
-    photo = update.message.photo
-    if not photo:
-        return None
-    file = await ctx.bot.get_file(photo[-1].file_id)
+async def photo_to_b64(bot, file_id: str) -> str:
+    file = await bot.get_file(file_id)
     buf = BytesIO()
     await file.download_to_memory(buf)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# ── Генерация SVG ──────────────────────────────────────────────────────────
+# ── Генерация PNG мокапа (режим визуализации) ──────────────────────────────
 
-async def generate_svg(prompt: str, model_key: str, size_key: str, image_b64: str | None = None) -> str:
-    model_id = MODELS[model_key][0]
-    _, w, h = SIZES[size_key]
+async def generate_mockup(prompt: str, images_b64: list[str]) -> bytes | str:
+    """
+    Принимает список фото (лого + флакон) и описание.
+    Возвращает PNG с визуализацией готового флакона.
+    """
+    parts = []
+    labels = ["логотип/брендинг", "флакон"]
+    for i, b64 in enumerate(images_b64):
+        label = labels[i] if i < len(labels) else f"фото {i+1}"
+        parts.append({"text": f"[{label}]:"})
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
 
-    system = f"""Ты — эксперт по SVG-макетам для профессиональной печати этикеток на флаконы.
-
-Отвечай ТОЛЬКО валидным SVG-кодом. Без пояснений. Без markdown. Без ```-блоков.
-Первый символ — '<', последний — '>' закрывающего </svg>.
-
-{palette_for_prompt()}
-
-{size_for_prompt(size_key)}
-
-ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:
-- xmlns="http://www.w3.org/2000/svg" обязателен
-- width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"
-- Прозрачный фон — никакого <rect> на весь размер
-- Красивый, детализированный дизайн этикетки
-- Используй <path>, <circle>, <rect>, <text>, <g> и другие SVG примитивы
-- Текст — читаемый, font-family="sans-serif"
-"""
-
-    user_parts = []
-    if image_b64:
-        user_parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})
-        user_parts.append({"text": (
-            f"На фото — логотип или изображение брендинга. "
-            f"Точно воспроизведи его в SVG макете этикетки для флакона. "
-            f"Описание стиля: {prompt}"
-        )})
-    else:
-        user_parts.append({"text": f"Создай SVG-этикетку для флакона: {prompt}"})
+    parts.append({"text": (
+        f"Создай реалистичный PNG мокап флакона с этикеткой. "
+        f"Используй предоставленные фото: логотип нанеси на флакон. "
+        f"Описание: {prompt}. "
+        f"Результат — красивая рекламная визуализация для презентации клиенту."
+    )})
 
     payload = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"parts": user_parts}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
-    }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(_url(model_id), json=payload)
-        r.raise_for_status()
-        data = r.json()
-
-    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    match = re.search(r"(<svg[\s\S]*?</svg>)", raw, re.IGNORECASE)
-    svg_code = match.group(1) if match else raw
-    return inject_spot_defs(svg_code)
-
-# ── Генерация PNG ──────────────────────────────────────────────────────────
-
-async def generate_image(prompt: str) -> bytes | str:
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "contents": [{"parts": parts}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(_url("gemini-2.0-flash-preview-image-generation"), json=payload)
         r.raise_for_status()
         data = r.json()
     for part in data["candidates"][0]["content"]["parts"]:
         if part.get("inlineData"):
             return base64.b64decode(part["inlineData"]["data"])
-    return "Gemini не вернул изображение. Попробуй изменить описание."
+    return "Gemini не вернул изображение."
+
+# ── Генерация SVG (режим печати) ───────────────────────────────────────────
+
+async def generate_svg(prompt: str, model_key: str, size_key: str, images_b64: list[str] | None = None) -> str:
+    model_id = MODELS[model_key][0]
+    _, w, h = SIZES[size_key]
+
+    system = f"""Ты — эксперт по SVG-макетам для профессиональной печати этикеток.
+Отвечай ТОЛЬКО валидным SVG-кодом. Без пояснений. Без markdown. Без ```.
+Первый символ — '<', последний — '>'.
+
+{palette_for_prompt()}
+{size_for_prompt(size_key)}
+
+ТРЕБОВАНИЯ:
+- xmlns="http://www.w3.org/2000/svg"
+- width="{w}mm" height="{h}mm" viewBox="0 0 {w} {h}"
+- Прозрачный фон
+- font-family="sans-serif"
+"""
+    parts = []
+    if images_b64:
+        labels = ["логотип/брендинг", "флакон для референса"]
+        for i, b64 in enumerate(images_b64):
+            label = labels[i] if i < len(labels) else f"фото {i+1}"
+            parts.append({"text": f"[{label}]:"})
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+        parts.append({"text": f"Создай SVG-этикетку используя логотип с фото. Описание: {prompt}"})
+    else:
+        parts.append({"text": f"Создай SVG-этикетку: {prompt}"})
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(_url(model_id), json=payload)
+        r.raise_for_status()
+        data = r.json()
+    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    match = re.search(r"(<svg[\s\S]*?</svg>)", raw, re.IGNORECASE)
+    svg_code = match.group(1) if match else raw
+    return inject_spot_defs(svg_code)
 
 # ── Отправка SVG ───────────────────────────────────────────────────────────
 
-async def send_svg(update: Update, svg_code: str, prompt: str, size_key: str, model_label: str):
+async def send_svg(update: Update, svg_code: str, prompt: str, size_key: str):
     size_label, w, h = SIZES[size_key]
     svg_bytes = BytesIO(svg_code.encode("utf-8"))
     await update.message.reply_document(
         document=svg_bytes,
         filename=f"label_{size_key}.svg",
-        caption=(
-            f"📄 *{prompt}*\n"
-            f"📐 {size_label} — {w}×{h}мм\n"
-            f"🎨 Spot_1 (белый) + CMYK | прозрачный фон"
-        ),
+        caption=f"📄 *{prompt}*\n📐 {size_label} — {w}×{h}мм\n🎨 Spot_1 (белый) + CMYK | прозрачный фон",
         parse_mode="Markdown",
     )
     intro = "```xml\n" + f"<!-- {size_label} ({w}×{h}мм) | Spot_1=белый | прозрачный фон -->\n"
@@ -192,18 +213,19 @@ async def send_svg(update: Update, svg_code: str, prompt: str, size_key: str, mo
 # ── Клавиатуры ─────────────────────────────────────────────────────────────
 
 def size_keyboard(current: str) -> InlineKeyboardMarkup:
-    buttons = []
-    for k, (label, w, h) in SIZES.items():
-        prefix = "✅ " if k == current else ""
-        buttons.append([InlineKeyboardButton(f"{prefix}{label}  ({w}×{h}мм)", callback_data=f"size:{k}")])
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            ("✅ " if k == current else "") + f"{label}  ({w}×{h}мм)",
+            callback_data=f"size:{k}"
+        )]
+        for k, (label, w, h) in SIZES.items()
+    ])
 
 def model_keyboard(current: str) -> InlineKeyboardMarkup:
-    buttons = []
-    for k, (_, label) in MODELS.items():
-        prefix = "✅ " if k == current else ""
-        buttons.append([InlineKeyboardButton(prefix + label, callback_data=f"model:{k}")])
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if k == current else "") + label, callback_data=f"model:{k}")]
+        for k, (_, label) in MODELS.items()
+    ])
 
 # ── Команды ────────────────────────────────────────────────────────────────
 
@@ -212,21 +234,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cmyk_text  = "\n".join(f"  `{h}`  —  {d}" for _, h, d in CMYK_COLORS)
     text = (
         "👋 Привет! Создаю макеты этикеток для флаконов.\n\n"
-        "🖼 *Картинка PNG:*\n"
-        "`/img <описание>` — сгенерировать изображение\n\n"
-        "✏️ *SVG мокап без логотипа:*\n"
-        "`/svg <описание>` — векторный макет со Spot-цветами\n\n"
-        "📸 *SVG мокап с твоим логотипом:*\n"
-        "Прикрепи фото + напиши `/svg <описание>` в подписи\n"
-        "Пример: отправь фото логотипа, в подписи напиши\n"
-        "`/svg шампунь с ромашкой, зелёные тона`\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🖼 *РЕЖИМ 1 — Визуализация для клиента (PNG):*\n"
+        "Отправь альбом из 2 фото (лого + флакон) с подписью\n"
+        "Пример подписи: `шампунь с ромашкой, надпись сверху`\n\n"
+        "Или одно фото с подписью начинающейся на /img:\n"
+        "`/img шампунь с ромашкой`\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✏️ *РЕЖИМ 2 — SVG макет для печати:*\n"
+        "Отправь фото лого с подписью `/svg описание`\n"
+        "Или просто: `/svg описание` без фото\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         "⚙️ *Настройки:*\n"
         "`/size` — размер флакона\n"
         "`/model` — модель Gemini\n\n"
-        "📐 *Размеры:*\n"
+        "📐 *Размеры SVG:*\n"
         f"{sizes_text}\n\n"
         "🎨 *Цвета SVG:*\n"
-        "  `url(#Spot_1)`  —  белый _(Spot-краска для станка)_\n"
+        "  `url(#Spot_1)`  —  белый _(Spot для станка)_\n"
         f"{cmyk_text}\n"
         "  Подложка — прозрачная"
     )
@@ -236,7 +261,7 @@ async def cmd_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current = ctx.user_data.get("svg_size", DEFAULT_SIZE)
     label, w, h = SIZES[current]
     await update.message.reply_text(
-        f"Текущий размер: *{label}* ({w}×{h}мм)\n\nВыбери размер флакона:",
+        f"Текущий: *{label}* ({w}×{h}мм)\n\nВыбери размер:",
         parse_mode="Markdown", reply_markup=size_keyboard(current),
     )
 
@@ -246,15 +271,12 @@ async def callback_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = query.data.split(":")[1]
     ctx.user_data["svg_size"] = key
     label, w, h = SIZES[key]
-    await query.edit_message_text(
-        f"✅ Размер выбран: *{label}* ({w}×{h}мм)",
-        parse_mode="Markdown", reply_markup=size_keyboard(key),
-    )
+    await query.edit_message_text(f"✅ *{label}* ({w}×{h}мм)", parse_mode="Markdown", reply_markup=size_keyboard(key))
 
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current = ctx.user_data.get("svg_model", DEFAULT_MODEL)
     await update.message.reply_text(
-        f"Текущая модель: *{MODELS[current][1]}*\n\nВыбери модель:",
+        f"Текущая: *{MODELS[current][1]}*\n\nВыбери модель:",
         parse_mode="Markdown", reply_markup=model_keyboard(current),
     )
 
@@ -263,78 +285,170 @@ async def callback_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     key = query.data.split(":")[1]
     ctx.user_data["svg_model"] = key
-    await query.edit_message_text(
-        f"✅ Модель выбрана: *{MODELS[key][1]}*",
-        parse_mode="Markdown", reply_markup=model_keyboard(key),
-    )
+    await query.edit_message_text(f"✅ *{MODELS[key][1]}*", parse_mode="Markdown", reply_markup=model_keyboard(key))
 
-async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(ctx.args)
-    if not prompt:
-        await update.message.reply_text(
-            "✏️ Укажи описание.\nПример: `/img шампунь с ромашкой`",
-            parse_mode="Markdown",
-        )
+# ── Обработчик альбома (несколько фото) ───────────────────────────────────
+
+async def process_album(chat_id: int, media_group_id: str, ctx: ContextTypes.DEFAULT_TYPE, update: Update):
+    """Вызывается через 1.5 сек после последнего фото альбома."""
+    await asyncio.sleep(1.5)
+
+    photos = album_buffer.pop(media_group_id, [])
+    if not photos:
         return
-    msg = await update.message.reply_text("🎨 Генерирую картинку...")
+
+    # Берём caption из первого сообщения альбома
+    caption = photos[0].get("caption", "") or ""
+    prompt  = re.sub(r"^/(img|svg)\s*", "", caption, flags=re.IGNORECASE).strip()
+    if not prompt:
+        prompt = "красивая этикетка для флакона"
+
+    is_svg = caption.lower().startswith("/svg")
+    file_ids = [p["file_id"] for p in photos]
+
+    msg = await ctx.bot.send_message(chat_id, "⏳ Скачиваю фото   ")
+    anim = asyncio.create_task(loading_animation(msg, "Генерирую макет"))
+
     try:
-        result = await generate_image(prompt)
-        if isinstance(result, bytes):
-            await update.message.reply_photo(photo=BytesIO(result), caption=f"🖼 *{prompt}*", parse_mode="Markdown")
+        images_b64 = [await photo_to_b64(ctx.bot, fid) for fid in file_ids]
+
+        if is_svg:
+            anim.cancel()
+            size_key    = ctx.user_data.get("svg_size",  DEFAULT_SIZE)
+            model_key   = ctx.user_data.get("svg_model", DEFAULT_MODEL)
+            size_label, w, h = SIZES[size_key]
+            await msg.edit_text(f"✏️ Создаю SVG макет…\n{size_label} ({w}×{h}мм)")
+            svg_code = await generate_svg(prompt, model_key, size_key, images_b64)
             await msg.delete()
+            # Отправляем от имени первого сообщения альбома
+            class _FakeUpdate:
+                def __init__(self, message):
+                    self.message = message
+            await send_svg(_FakeUpdate(photos[0]["message"]), svg_code, prompt, size_key)
         else:
-            await msg.edit_text(f"⚠️ {result}")
+            anim.cancel()
+            await msg.edit_text("🎨 Рисую визуализацию для клиента…")
+            result = await generate_mockup(prompt, images_b64)
+            await msg.delete()
+            if isinstance(result, bytes):
+                await photos[0]["message"].reply_photo(
+                    photo=BytesIO(result),
+                    caption=f"🖼 *{prompt}*",
+                    parse_mode="Markdown",
+                )
+            else:
+                await photos[0]["message"].reply_text(f"⚠️ {result}")
+
     except httpx.HTTPStatusError as e:
-        logger.error("Gemini image error: %s", e.response.text)
+        anim.cancel()
+        logger.error("Gemini error: %s", e.response.text)
         await msg.edit_text("❌ Ошибка Gemini API.")
     except Exception as e:
-        logger.exception("Unexpected error in /img")
+        anim.cancel()
+        logger.exception("Unexpected error in process_album")
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-# ── /svg — работает и с фото и без ────────────────────────────────────────
+    album_tasks.pop(media_group_id, None)
 
-async def handle_svg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает две ситуации:
-    1. /svg описание                     — обычное текстовое сообщение с командой
-    2. фото + подпись "/svg описание"    — фото с командой в caption
-    """
-    # Получаем текст — либо из caption фото, либо из текста сообщения
-    raw_text = update.message.caption or update.message.text or ""
 
-    # Убираем команду /svg из начала
-    prompt = re.sub(r"^/svg\s*", "", raw_text, flags=re.IGNORECASE).strip()
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Получает каждое фото — одиночное или из альбома."""
+    msg    = update.message
+    photo  = msg.photo[-1]
+    caption = msg.caption or ""
+    media_group_id = msg.media_group_id
+
+    if media_group_id:
+        # Альбом — буферизуем и ждём все фото
+        album_buffer[media_group_id].append({
+            "file_id": photo.file_id,
+            "caption": caption,
+            "message": msg,
+        })
+        # Отменяем предыдущую задачу если есть, запускаем новую
+        if media_group_id in album_tasks:
+            album_tasks[media_group_id].cancel()
+        album_tasks[media_group_id] = asyncio.create_task(
+            process_album(msg.chat_id, media_group_id, ctx, update)
+        )
+    else:
+        # Одиночное фото
+        prompt  = re.sub(r"^/(img|svg)\s*", "", caption, flags=re.IGNORECASE).strip()
+        is_svg  = caption.lower().startswith("/svg")
+
+        if not prompt:
+            await msg.reply_text(
+                "📸 Фото получено!\n\n"
+                "Добавь подпись к фото:\n"
+                "• `/svg описание` — SVG макет для печати\n"
+                "• `/img описание` — PNG визуализация для клиента\n\n"
+                "Или отправь альбом (2 фото: лого + флакон) с подписью.",
+                parse_mode="Markdown",
+            )
+            return
+
+        status_msg = await msg.reply_text("⏳ Скачиваю фото   ")
+        anim = asyncio.create_task(loading_animation(status_msg, "Генерирую" + (" SVG" if is_svg else " визуализацию")))
+
+        try:
+            image_b64 = await photo_to_b64(ctx.bot, photo.file_id)
+
+            if is_svg:
+                anim.cancel()
+                size_key  = ctx.user_data.get("svg_size",  DEFAULT_SIZE)
+                model_key = ctx.user_data.get("svg_model", DEFAULT_MODEL)
+                size_label, w, h = SIZES[size_key]
+                await status_msg.edit_text(f"✏️ Создаю SVG…\n{size_label} ({w}×{h}мм)")
+                svg_code = await generate_svg(prompt, model_key, size_key, [image_b64])
+                await status_msg.delete()
+                await send_svg(update, svg_code, prompt, size_key)
+            else:
+                anim.cancel()
+                await status_msg.edit_text("🎨 Рисую визуализацию для клиента…")
+                result = await generate_mockup(prompt, [image_b64])
+                await status_msg.delete()
+                if isinstance(result, bytes):
+                    await msg.reply_photo(photo=BytesIO(result), caption=f"🖼 *{prompt}*", parse_mode="Markdown")
+                else:
+                    await status_msg.edit_text(f"⚠️ {result}")
+
+        except httpx.HTTPStatusError as e:
+            anim.cancel()
+            logger.error("Gemini error: %s", e.response.text)
+            await status_msg.edit_text("❌ Ошибка Gemini API.")
+        except Exception as e:
+            anim.cancel()
+            logger.exception("handle_photo error")
+            await status_msg.edit_text(f"❌ Ошибка: {e}")
+
+
+async def handle_svg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/svg без фото — текстовая команда."""
+    prompt = " ".join(ctx.args).strip()
     if not prompt:
         await update.message.reply_text(
-            "✏️ Укажи описание после команды.\n"
-            "Пример: `/svg шампунь с ромашкой, зелёные тона`\n\n"
+            "✏️ Укажи описание.\nПример: `/svg шампунь с ромашкой`\n\n"
             "Или отправь фото с подписью `/svg описание`",
             parse_mode="Markdown",
         )
         return
-
-    model_key   = ctx.user_data.get("svg_model", DEFAULT_MODEL)
-    size_key    = ctx.user_data.get("svg_size",  DEFAULT_SIZE)
-    model_label = MODELS[model_key][1]
+    size_key  = ctx.user_data.get("svg_size",  DEFAULT_SIZE)
+    model_key = ctx.user_data.get("svg_model", DEFAULT_MODEL)
     size_label, w, h = SIZES[size_key]
-
-    # Есть ли фото в сообщении?
-    has_photo = bool(update.message.photo)
-    photo_note = " + логотип 📸" if has_photo else ""
-
-    msg = await update.message.reply_text(
-        f"✏️ Генерирую SVG{photo_note}…\n{size_label} ({w}×{h}мм) | {model_label}"
-    )
+    msg  = await update.message.reply_text(f"⏳ Генерирую SVG   ")
+    anim = asyncio.create_task(loading_animation(msg, f"Создаю SVG макет {size_label}"))
     try:
-        image_b64 = await download_photo_base64(update, ctx) if has_photo else None
-        svg_code  = await generate_svg(prompt, model_key, size_key, image_b64)
-        await send_svg(update, svg_code, prompt, size_key, model_label)
+        svg_code = await generate_svg(prompt, model_key, size_key)
+        anim.cancel()
         await msg.delete()
+        await send_svg(update, svg_code, prompt, size_key)
     except httpx.HTTPStatusError as e:
+        anim.cancel()
         logger.error("Gemini error: %s", e.response.text)
         await msg.edit_text("❌ Ошибка Gemini API.")
     except Exception as e:
-        logger.exception("Unexpected error in handle_svg")
+        anim.cancel()
+        logger.exception("handle_svg_text error")
         await msg.edit_text(f"❌ Ошибка: {e}")
 
 # ── Запуск ─────────────────────────────────────────────────────────────────
@@ -345,20 +459,10 @@ def main():
     app.add_handler(CommandHandler("help",  cmd_start))
     app.add_handler(CommandHandler("size",  cmd_size))
     app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("img",   cmd_img))
-
-    # /svg как текст
-    app.add_handler(CommandHandler("svg", handle_svg))
-
-    # фото с подписью /svg ... — Telegram передаёт как photo + caption
-    app.add_handler(MessageHandler(
-        filters.PHOTO & filters.CaptionRegex(r"(?i)^/svg"),
-        handle_svg
-    ))
-
+    app.add_handler(CommandHandler("svg",   handle_svg_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(callback_size,  pattern=r"^size:"))
     app.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
-
     logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True)
 
