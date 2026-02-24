@@ -28,9 +28,9 @@ def _url(model: str) -> str:
     )
 
 MODELS = {
-    "flash": ("gemini-2.0-flash",             "⚡ Flash 2.0  — быстро и дёшево"),
-    "pro25": ("gemini-2.5-pro-preview-06-05", "🧠 Pro 2.5    — умнее"),
-    "pro31": ("gemini-2.5-pro-preview-06-05", "✨ Pro 3.1    — максимум качества"),
+    "flash": ("gemini-3-flash", "⚡ Flash 3.0  — быстро и дёшево"),
+    "pro3":  ("gemini-3-pro",   "🧠 Pro 3.0    — умнее"),
+    "pro31": ("gemini-3.1-pro", "✨ Pro 3.1    — максимум качества"),
 }
 DEFAULT_MODEL = "pro31"
 
@@ -139,7 +139,7 @@ async def generate_mockup(prompt: str, images_b64: list[str]) -> bytes | str:
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(_url("gemini-2.0-flash-preview-image-generation"), json=payload)
+        r = await client.post(_url("gemini-3-pro-image-preview"), json=payload)
         r.raise_for_status()
         data = r.json()
     for part in data["candidates"][0]["content"]["parts"]:
@@ -465,6 +465,10 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
     logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
+
 
 if __name__ == "__main__":
     main()
