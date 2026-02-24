@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import logging
 import httpx
 from io import BytesIO
@@ -8,7 +9,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
+    filters,
     ContextTypes,
 )
 
@@ -361,3 +364,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
