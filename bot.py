@@ -417,10 +417,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error("Gemini error: %s", e.response.text)
             await status_msg.edit_text("❌ Ошибка Gemini API.")
         except Exception as e:
-        anim.cancel()
-        logger.exception("handle_svg_text error")
-        # Отправляем новое сообщение, так как старое с точками могло быть уже удалено
-        await update.message.reply_text("❌ Произошла ошибка при отправке файла или генерации.")
+            anim.cancel()
+            logger.exception("handle_svg_text error")
+            # Отправляем новое сообщение, так как старое с точками могло быть уже удалено
+            await update.message.reply_text("❌ Произошла ошибка при отправке файла или генерации.")
 
 
 async def handle_svg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
