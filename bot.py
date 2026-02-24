@@ -19,7 +19,7 @@ from telegram.ext import (
 
 # ── Настройки ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8663079063:AAGgB5D0kzZQhj12_pO_loeFfTn9miajKFI")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCje5Bd2I_sCTaG8QwRLJWv0hGUGGSj3uQ")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ВАШ_GEMINI_KEY_СЮДА")
 
 def _url(model: str) -> str:
     return (
