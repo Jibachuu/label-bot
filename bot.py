@@ -32,7 +32,7 @@ MODELS = {
     "pro3":  ("gemini-3-pro-preview",   "🧠 Pro 3.0    — умнее"),
     "pro31": ("gemini-3.1-pro-preview", "✨ Pro 3.1    — максимум качества"),
 }
-DEFAULT_MODEL = "pro31"
+DEFAULT_MODEL = "pro3"
 
 SIZES = {
     "300_no_cap":   ("🧴 300мл без крышки",  150.0,   58.0),
