@@ -28,9 +28,9 @@ def _url(model: str) -> str:
     )
 
 MODELS = {
-    "flash": ("gemini-3-flash", "⚡ Flash 3.0  — быстро и дёшево"),
-    "pro3":  ("gemini-3-pro",   "🧠 Pro 3.0    — умнее"),
-    "pro31": ("gemini-3.1-pro", "✨ Pro 3.1    — максимум качества"),
+    "flash": ("gemini-3-flash-preview", "⚡ Flash 3.0  — быстро и дёшево"),
+    "pro3":  ("gemini-3-pro-preview",   "🧠 Pro 3.0    — умнее"),
+    "pro31": ("gemini-3.1-pro-preview", "✨ Pro 3.1    — максимум качества"),
 }
 DEFAULT_MODEL = "pro31"
 
