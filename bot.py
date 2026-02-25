@@ -70,6 +70,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Текущая модель: *{MODELS[current]['label']}*\n\n"
         "⚙️ Команды:\n"
         "`/model` — сменить модель\n"
+        "`/draw <описание>` — нарисовать картинку\n"
         "`/clear` — очистить историю диалога\n"
         "`/start` — это сообщение",
         parse_mode="Markdown",
@@ -170,6 +171,69 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.exception("handle_photo error")
         await msg.edit_text(f"❌ Ошибка: {e}")
 
+
+async def handle_draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/draw — генерация картинки через Gemini image generation."""
+    # Поддерживаем и текст и фото с подписью /draw
+    caption = update.message.caption or ""
+    text    = update.message.text or ""
+    raw     = caption if caption else text
+    prompt  = raw.replace("/draw", "").strip()
+
+    if not prompt:
+        await update.message.reply_text(
+            "✏️ Напиши что нарисовать.\nПример: `/draw флакон шампуня с логотипом ÉCLAT`\n\n"
+            "Или отправь фото с подписью `/draw описание`",
+            parse_mode="Markdown",
+        )
+        return
+
+    parts = []
+    # Если есть фото — добавляем его
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file  = await ctx.bot.get_file(photo.file_id)
+        buf   = BytesIO()
+        await file.download_to_memory(buf)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+
+    parts.append({"text": prompt})
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+    }
+
+    msg = await update.message.reply_text("🎨 Рисую...")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(api_url("gemini-2.0-flash-preview-image-generation"), json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        image_bytes = None
+        for part in data["candidates"][0]["content"]["parts"]:
+            if part.get("inlineData"):
+                image_bytes = base64.b64decode(part["inlineData"]["data"])
+                break
+
+        if image_bytes:
+            await msg.delete()
+            await update.message.reply_photo(
+                photo=BytesIO(image_bytes),
+                caption=f"🖼 {prompt}",
+            )
+        else:
+            await msg.edit_text("⚠️ Gemini не вернул картинку. Попробуй изменить описание.")
+
+    except httpx.HTTPStatusError as e:
+        logger.error("Draw error: %s", e.response.text)
+        await msg.edit_text(f"❌ Ошибка Gemini: {e.response.status_code}")
+    except Exception as e:
+        logger.exception("handle_draw error")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
 # ── Запуск ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -177,8 +241,10 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_start))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("draw",  handle_draw))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r'(?i)^/draw'), handle_draw))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Бот запущен!")
