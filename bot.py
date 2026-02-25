@@ -34,6 +34,12 @@ MODELS = {
 }
 DEFAULT_MODEL = "pro"
 
+
+# Буфер для альбомов
+from collections import defaultdict
+album_buffer: dict = defaultdict(list)
+album_tasks: dict = {}
+
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -145,15 +151,91 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Обработка фото ─────────────────────────────────────────────────────────
 
+async def process_album_draw(chat_id, media_group_id, ctx, first_message, prompt):
+    """Обрабатывает альбом для /draw — ждёт все фото и генерирует картинку."""
+    await asyncio.sleep(1.5)
+    photos = album_buffer.pop(media_group_id, [])
+    album_tasks.pop(media_group_id, None)
+    if not photos:
+        return
+
+    msg = await ctx.bot.send_message(chat_id, "🎨 Рисую...")
+    try:
+        parts = []
+        for file_id in photos:
+            file = await ctx.bot.get_file(file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
+        parts.append({"text": prompt})
+
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+        }
+
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=120) as client:
+                r = await client.post(api_url("gemini-3-pro-image-preview"), json=payload)
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 3)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+
+        image_bytes = None
+        for part in data["candidates"][0]["content"]["parts"]:
+            if part.get("inlineData"):
+                image_bytes = base64.b64decode(part["inlineData"]["data"])
+                break
+
+        if image_bytes:
+            await msg.delete()
+            await first_message.reply_photo(photo=BytesIO(image_bytes), caption=f"🖼 {prompt}")
+        else:
+            await msg.edit_text("⚠️ Gemini не вернул картинку.")
+
+    except httpx.HTTPStatusError as e:
+        logger.error("Draw album error: %s", e.response.text)
+        await msg.edit_text(f"❌ Ошибка Gemini: {e.response.status_code}")
+    except Exception as e:
+        logger.exception("process_album_draw error")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    caption = msg.caption or ""
+    is_draw = caption.lower().startswith("/draw")
+    media_group_id = msg.media_group_id
+
+    if is_draw and media_group_id:
+        # Альбом с /draw — буферизуем фото
+        prompt = caption.replace("/draw", "").strip() or "нарисуй"
+        album_buffer[media_group_id].append(msg.photo[-1].file_id)
+
+        if media_group_id in album_tasks:
+            album_tasks[media_group_id].cancel()
+        album_tasks[media_group_id] = asyncio.create_task(
+            process_album_draw(msg.chat_id, media_group_id, ctx, msg, prompt)
+        )
+        return
+
+    if is_draw:
+        # Одно фото с /draw
+        await handle_draw(update, ctx)
+        return
+
+    # Обычное фото — отправляем в чат с Gemini
     model_key = ctx.user_data.get("model", DEFAULT_MODEL)
     model_id  = MODELS[model_key]["id"]
     history   = ctx.user_data.get("history", [])
 
-    caption = update.message.caption or "Опиши что на фото"
+    caption = caption or "Опиши что на фото"
 
-    # Скачиваем фото
-    photo = update.message.photo[-1]
+    photo = msg.photo[-1]
     file  = await ctx.bot.get_file(photo.file_id)
     buf   = BytesIO()
     await file.download_to_memory(buf)
@@ -167,23 +249,23 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
     })
 
-    msg = await update.message.reply_text("⏳")
+    status = await msg.reply_text("⏳")
     try:
-        await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
+        await ctx.bot.send_chat_action(msg.chat.id, "typing")
         reply = await ask_gemini(model_id, history)
         history.append({"role": "model", "parts": [{"text": reply}]})
         ctx.user_data["history"] = history[-20:]
 
-        await msg.delete()
+        await status.delete()
         for i in range(0, len(reply), 4000):
-            await update.message.reply_text(reply[i:i+4000])
+            await msg.reply_text(reply[i:i+4000])
 
     except httpx.HTTPStatusError as e:
         logger.error("Gemini error: %s", e.response.text)
-        await msg.edit_text(f"❌ Ошибка Gemini: {e.response.status_code}")
+        await status.edit_text(f"❌ Ошибка Gemini: {e.response.status_code}")
     except Exception as e:
         logger.exception("handle_photo error")
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        await status.edit_text(f"❌ Ошибка: {e}")
 
 
 async def handle_draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -263,7 +345,6 @@ def main():
     app.add_handler(CommandHandler("draw",  handle_draw))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
-    app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r'(?i)^/draw'), handle_draw))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Бот запущен!")
