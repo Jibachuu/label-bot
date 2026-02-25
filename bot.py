@@ -19,12 +19,16 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ВАШ_GEMINI_KEY_СЮДА")
 
 MODELS = {
     "flash": {
-        "id": "gemini-2.0-flash",
-        "label": "⚡ Gemini Flash 2.0  — быстро и дёшево",
+        "id": "gemini-2.5-flash",
+        "label": "⚡ Gemini 2.5 Flash  — быстро и дёшево",
     },
     "pro": {
-        "id": "gemini-2.5-pro-preview-06-05",
-        "label": "✨ Gemini Pro 3.1  — максимум качества",
+        "id": "gemini-2.5-pro",
+        "label": "✨ Gemini 2.5 Pro  — умнее и мощнее",
+    },
+    "pro3": {
+        "id": "gemini-3-pro-preview",
+        "label": "🚀 Gemini 3 Pro  — максимум качества",
     },
 }
 DEFAULT_MODEL = "pro"
