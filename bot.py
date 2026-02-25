@@ -208,7 +208,7 @@ async def handle_draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎨 Рисую...")
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(api_url("gemini-2.0-flash-preview-image-generation"), json=payload)
+            r = await client.post(api_url("gemini-3-pro-image-preview"), json=payload)
             r.raise_for_status()
             data = r.json()
 
