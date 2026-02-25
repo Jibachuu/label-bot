@@ -1,4 +1,16 @@
 import os
+import sys
+
+print("=== ЗАПУСК СКРИПТА ===", flush=True)
+try:
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    print(f"Токен Телеграм: {'НАЙДЕН' if TELEGRAM_TOKEN else 'ПУСТО! Проверьте Variables'}", flush=True)
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    print(f"Ключ Gemini: {'НАЙДЕН' if GEMINI_API_KEY else 'ПУСТО! Проверьте Variables'}", flush=True)
+except Exception as e:
+    print(f"Критическая ошибка: {e}", flush=True)
+
+
 import re
 import base64
 import logging
