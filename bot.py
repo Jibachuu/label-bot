@@ -139,7 +139,7 @@ async def generate_mockup(prompt: str, images_b64: list[str]) -> bytes | str:
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
     async with httpx.AsyncClient(timeout=600) as client:
-        r = await client.post(_url("gemini-3-pro-image-preview"), json=payload)
+        r = await client.post(_url("gemini-3-flash-preview"), json=payload)
         r.raise_for_status()
         data = r.json()
     for part in data["candidates"][0]["content"]["parts"]:
@@ -333,8 +333,7 @@ async def process_album(chat_id: int, media_group_id: str, ctx: ContextTypes.DEF
             if isinstance(result, bytes):
                 await photos[0]["message"].reply_photo(
                     photo=BytesIO(result),
-                    caption=f"🖼 *{prompt}*",
-                    parse_mode="Markdown",
+                    caption=f"🖼 {prompt}"  # Убрали Markdown, чтобы не крашился Телеграм
                 )
             else:
                 await photos[0]["message"].reply_text(f"⚠️ {result}")
@@ -407,10 +406,15 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text("🎨 Рисую визуализацию для клиента…")
                 result = await generate_mockup(prompt, [image_b64])
                 await status_msg.delete()
+                
                 if isinstance(result, bytes):
-                    await msg.reply_photo(photo=BytesIO(result), caption=f"🖼 *{prompt}*", parse_mode="Markdown")
+                    await msg.reply_photo(
+                        photo=BytesIO(result),
+                        caption=f"🖼 {prompt}"  # Убрали Markdown
+                    )
                 else:
-                    await status_msg.edit_text(f"⚠️ {result}")
+                    # Исправили status_msg на msg, так как status_msg уже удалено!
+                    await msg.reply_text(f"⚠️ {result}")
 
         except httpx.HTTPStatusError as e:
             anim.cancel()
