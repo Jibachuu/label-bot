@@ -1,6 +1,7 @@
 import os
 import base64
 import logging
+import asyncio
 import httpx
 from io import BytesIO
 
@@ -53,11 +54,24 @@ async def ask_gemini(model_id: str, history: list) -> str:
         "contents": history,
         "generationConfig": {"maxOutputTokens": 8192},
     }
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(api_url(model_id), json=payload)
-        r.raise_for_status()
-        data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    for attempt in range(3):  # 3 попытки
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                r = await client.post(api_url(model_id), json=payload)
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    wait = (attempt + 1) * 3  # 3 сек, потом 6 сек
+                    logger.warning(f"Gemini {r.status_code}, retry in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except httpx.TimeoutException:
+            if attempt < 2:
+                await asyncio.sleep(5)
+                continue
+            raise
+    raise Exception("Gemini не ответил после 3 попыток")
 
 # ── Команды ────────────────────────────────────────────────────────────────
 
@@ -207,10 +221,15 @@ async def handle_draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("🎨 Рисую...")
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(api_url("gemini-3-pro-image-preview"), json=payload)
-            r.raise_for_status()
-            data = r.json()
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=120) as client:
+                r = await client.post(api_url("gemini-3-pro-image-preview"), json=payload)
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 3)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
 
         image_bytes = None
         for part in data["candidates"][0]["content"]["parts"]:
